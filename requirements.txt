@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
-google-generativeai==0.8.3
-aiohttp==3.9.5
-httpx==0.27.0
+python-telegram-bot
+google-generativeai
+aiohttp
+httpx
