@@ -1,14 +1,20 @@
 import os
 import asyncio
 import logging
+import sqlite3
+from datetime import date
 import httpx
 from aiohttp import web
-import google.generativeai as genai
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     filters,
     ContextTypes,
@@ -19,80 +25,336 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# --- CONFIGURATION (Bypasses GitHub Secret Scanner) ---
-BOT_TOKEN = "8886552644:" + "AAFR77paHf8LNvpMwN4mHEF9hkF3YitacrY"
-GEMINI_API_KEY = "AQ.Ab8RN6LjooRdCIP2" + "TEC4J4U5-qNJ9scFdrMkhHi4OpvHdnEODw"
+# --- BOT CONFIGURATION ---
+BOT_TOKEN = "8056463990:AAGoV71k_sH8W5jH2vVfJ8Lw8Z7Z8Z8Z8Z8"  # Apna Info Bot Token
+ADMIN_ID = 6878347712
 
-FOOTER_TEXT = "\n\n━━━━━━━━━━━━━━━━━━━━\n<b>Powered by Gemini AI | Created by @abhisxhxz</b>"
+FOOTER_TEXT = "\n\n━━━━━━━━━━━━━━━━━━━━\nCreated by - Abhishek ( @abhisxhxz )"
 
-# Gemini Model Setup
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+http_client = httpx.AsyncClient(timeout=45.0)
+USER_STATES = {}
 
-http_client = httpx.AsyncClient(timeout=15.0)
+# --- DATABASE SETUP ---
+DB_FILE = "users_data.db"
 
-# Message chunking for Telegram limits (4096 char limit)
-def split_message(text, chunk_size=4000):
-    chunks = []
-    while len(text) > chunk_size:
-        split_idx = text.rfind("\n", 0, chunk_size)
-        if split_idx == -1:
-            split_idx = chunk_size
-        chunks.append(text[:split_idx])
-        text = text[split_idx:].lstrip()
-    if text:
-        chunks.append(text)
-    return chunks
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            credits INTEGER DEFAULT 5,
+            last_date TEXT,
+            referred_by INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# --- COMMAND HANDLERS ---
+init_db()
+
+def get_user_credits(user_id):
+    today_str = str(date.today())
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT credits, last_date FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+
+    if not row:
+        c.execute("INSERT INTO users (user_id, credits, last_date) VALUES (?, 5, ?)", (user_id, today_str))
+        conn.commit()
+        conn.close()
+        return 5
+    else:
+        credits, last_date = row
+        # Daily reset agar new day ho gaya hai
+        if last_date != today_str:
+            credits = 5
+            c.execute("UPDATE users SET credits = ?, last_date = ? WHERE user_id = ?", (credits, today_str, user_id))
+            conn.commit()
+        conn.close()
+        return credits
+
+def deduct_credit(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET credits = credits - 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def add_referral_credits(referrer_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET credits = credits + 5 WHERE user_id = ?", (referrer_id,))
+    conn.commit()
+    conn.close()
+
+# --- KEYBOARDS ---
+def get_main_menu():
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 Num Info", callback_data="num_info"),
+            InlineKeyboardButton("👤 User to Num", callback_data="user_to_num"),
+        ],
+        [
+            InlineKeyboardButton("🎁 Refer & Earn", callback_data="refer_earn"),
+            InlineKeyboardButton("💳 My Credits", callback_data="my_credits"),
+        ],
+        [
+            InlineKeyboardButton("👑 Owner", url="https://t.me/abhisxhxz"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_button():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
+    )
+
+# --- COMMANDS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    user_id = user.id
+    today_str = str(date.today())
+
+    # Check Referral
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    existing_user = c.fetchone()
+
+    if not existing_user and context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_"):
+            try:
+                referrer_id = int(arg.replace("ref_", ""))
+                if referrer_id != user_id:
+                    # New user register with referrer
+                    c.execute("INSERT INTO users (user_id, credits, last_date, referred_by) VALUES (?, 5, ?, ?)", (user_id, today_str, referrer_id))
+                    conn.commit()
+                    add_referral_credits(referrer_id)
+
+                    try:
+                        await context.bot.send_message(
+                            chat_id=referrer_id,
+                            text=f"🎉 <b>New Referral!</b>\n\nUser <b>{user.first_name}</b> ne aapke link se join kiya!\nAapko <b>+5 Credits</b> mil gaye hain! 🎁",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    conn.close()
+
+    credits = get_user_credits(user_id)
+
     welcome_text = (
-        f"👋 <b>Namaste {user.first_name}!</b>\n\n"
-        "🤖 Main aapka personal <b>Google Gemini AI Assistant</b> hoon.\n\n"
-        "Aap mujhse koi bhi sawal pooch sakte hain:\n"
-        "• Study & Homework help\n"
-        "• Coding & Tech problems\n"
-        "• Content creation, Shayari & Translation\n"
-        "• Daily advice & Info\n\n"
-        "Bas apna sawal likhkar bhejein, main turant answer dunga!"
+        f"👋 Welcome <b>{user.first_name}</b>!\n\n"
+        "⚡ <b>Abhishek Info Bot</b> me aapka swagat hai.\n"
+        f"💳 <b>Aapke Credits:</b> <code>{credits}</code> searches bache hain (Daily 5 free).\n\n"
+        "Niche diye gaye buttons me se select karein:"
         f"{FOOTER_TEXT}"
     )
-    await update.message.reply_text(welcome_text, parse_mode="HTML")
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            welcome_text, reply_markup=get_main_menu(), parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            welcome_text, reply_markup=get_main_menu(), parse_mode="HTML"
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+    bot_info = await context.bot.get_me()
+
+    if data == "num_info":
+        if get_user_credits(user_id) <= 0:
+            await query.edit_message_text(
+                "❌ <b>Daily Limit Khatam!</b>\n\n"
+                "Aapke aaj ke 5 searches pure ho chuke hain.\n"
+                "Friends ko refer karein aur har refer par <b>+5 Credits</b> paayein!",
+                reply_markup=get_main_menu(),
+                parse_mode="HTML"
+            )
+            return
+
+        USER_STATES[user_id] = "AWAITING_NUM"
+        await query.edit_message_text(
+            "📞 <b>Mobile Number Bhejo:</b>\n\n"
+            "Example: <code>9876543210</code>"
+            f"{FOOTER_TEXT}",
+            reply_markup=get_back_button(),
+            parse_mode="HTML",
+        )
+
+    elif data == "user_to_num":
+        if get_user_credits(user_id) <= 0:
+            await query.edit_message_text(
+                "❌ <b>Daily Limit Khatam!</b>\n\n"
+                "Aapke aaj ke 5 searches pure ho chuke hain.\n"
+                "Friends ko refer karein aur har refer par <b>+5 Credits</b> paayein!",
+                reply_markup=get_main_menu(),
+                parse_mode="HTML"
+            )
+            return
+
+        USER_STATES[user_id] = "AWAITING_USERNAME"
+        await query.edit_message_text(
+            "👤 <b>Telegram Username Bhejo:</b>\n\n"
+            "Example: <code>@abhisxhxz</code> ya <code>abhisxhxz</code>"
+            f"{FOOTER_TEXT}",
+            reply_markup=get_back_button(),
+            parse_mode="HTML",
+        )
+
+    elif data == "refer_earn":
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+        await query.edit_message_text(
+            "🎁 <b>Refer & Earn Program:</b>\n\n"
+            "Apne dosto ko bot refer karo aur har referral par <b>5 extra credits</b> paao!\n\n"
+            f"🔗 <b>Aapka Unique Referral Link:</b>\n<code>{ref_link}</code>\n\n"
+            "<i>(Link par tap karke copy karein aur share karein)</i>"
+            f"{FOOTER_TEXT}",
+            reply_markup=get_back_button(),
+            parse_mode="HTML"
+        )
+
+    elif data == "my_credits":
+        credits = get_user_credits(user_id)
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+        await query.edit_message_text(
+            "💳 <b>Aapka Account Status:</b>\n\n"
+            f"🔹 <b>Available Credits:</b> <code>{credits}</code> searches\n"
+            "🔹 <b>Daily Reset:</b> 5 Searches Har Din\n\n"
+            f"🔗 <b>Invite Link:</b>\n<code>{ref_link}</code>"
+            f"{FOOTER_TEXT}",
+            reply_markup=get_back_button(),
+            parse_mode="HTML"
+        )
+
+    elif data == "back_home":
+        USER_STATES[user_id] = None
+        await start(update, context)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_prompt = update.message.text.strip()
-    if not user_prompt:
+    user_id = update.effective_user.id
+    state = USER_STATES.get(user_id)
+    text = update.message.text.strip()
+
+    if not state:
+        await update.message.reply_text(
+            "Kripya menu se option select karein:",
+            reply_markup=get_main_menu(),
+        )
         return
 
-    # Typing status bhejna jab tak answer ready hota hai
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-    try:
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: model.generate_content(user_prompt)
+    if get_user_credits(user_id) <= 0:
+        await update.message.reply_text(
+            "❌ <b>Credits Khatam!</b>\n\n"
+            "Aapka aaj ka limit complete ho chuka hai. Referral link share karke credits add karein.",
+            reply_markup=get_main_menu(),
+            parse_mode="HTML"
         )
-        ai_reply = response.text.strip() if response and response.text else "Mujhe iska uttar nahi mila, kripya dobara poochhein."
-    except Exception as e:
-        logging.error(f"Gemini API Error: {e}")
-        ai_reply = f"⚠️ Error: {str(e)}"
+        USER_STATES[user_id] = None
+        return
 
-    full_response = f"{ai_reply}{FOOTER_TEXT}"
-    chunks = split_message(full_response)
+    # --- NUM INFO LOOKUP ---
+    if state == "AWAITING_NUM":
+        clean_num = text.replace("+91", "").replace(" ", "").replace("-", "")
+        if not (clean_num.isdigit() and len(clean_num) == 10):
+            await update.message.reply_text(
+                "❌ Kripya sahi 10-digit mobile number enter karein.",
+                reply_markup=get_back_button(),
+            )
+            return
 
-    for chunk in chunks:
+        deduct_credit(user_id)
+        rem_credits = get_user_credits(user_id)
+
+        status_msg = await update.message.reply_text("⏳ <i>Searching details in database...</i>", parse_mode="HTML")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
         try:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
-        except Exception:
-            # Agar markdown parsing fail ho toh plain text bhejna
-            await update.message.reply_text(chunk)
+            url = f"https://kallu-api.vercel.app/api?num={clean_num}"
+            res = await http_client.get(url)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "success" and "result" in data:
+                    r = data["result"]
+                    reply = (
+                        "📋 <b>DETAILS FOUND:</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"👤 <b>Name:</b> <code>{r.get('name', 'N/A')}</code>\n"
+                        f"📞 <b>Mobile:</b> <code>{r.get('mobile', clean_num)}</code>\n"
+                        f"📱 <b>Alt Mobile:</b> <code>{r.get('alt_mobile', 'N/A')}</code>\n"
+                        f"📍 <b>Circle:</b> <code>{r.get('circle', 'N/A')}</code>\n"
+                        f"🏠 <b>Address:</b> <code>{r.get('address', 'N/A')}</code>\n\n"
+                        f"💳 <i>Remaining Credits: {rem_credits}</i>"
+                        f"{FOOTER_TEXT}"
+                    )
+                else:
+                    reply = f"❌ Number <code>{clean_num}</code> ka data nahi mila.\n💳 <i>Remaining Credits: {rem_credits}</i>{FOOTER_TEXT}"
+            else:
+                reply = f"⚠️ Server response error ({res.status_code}).{FOOTER_TEXT}"
+        except httpx.TimeoutException:
+            reply = f"⏱️ Server Timeout! Database busy hai.{FOOTER_TEXT}"
+        except Exception as e:
+            reply = f"⚠️ Error: {str(e)}{FOOTER_TEXT}"
 
-# --- RENDER WEB SERVER (PORT BINDING) ---
+        USER_STATES[user_id] = None
+        await status_msg.edit_text(reply, reply_markup=get_back_button(), parse_mode="HTML")
+
+    # --- USERNAME TO NUMBER LOOKUP ---
+    elif state == "AWAITING_USERNAME":
+        clean_user = text.replace("@", "").strip()
+
+        deduct_credit(user_id)
+        rem_credits = get_user_credits(user_id)
+
+        status_msg = await update.message.reply_text("⏳ <i>Searching username in database...</i>", parse_mode="HTML")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+        try:
+            url = f"https://kallu-api.vercel.app/tg?username={clean_user}"
+            res = await http_client.get(url)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "success" and "number" in data:
+                    phone = data["number"]
+                    reply = (
+                        "🎯 <b>NUMBER FOUND:</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"🏷 <b>Username:</b> @{clean_user}\n"
+                        f"📞 <b>Phone:</b> <code>{phone}</code>\n\n"
+                        f"💳 <i>Remaining Credits: {rem_credits}</i>"
+                        f"{FOOTER_TEXT}"
+                    )
+                else:
+                    reply = (
+                        f"❌ Username @{clean_user} ka number nahi mila.\n\n"
+                        f"💳 <i>Remaining Credits: {rem_credits}</i>"
+                        f"{FOOTER_TEXT}"
+                    )
+            else:
+                reply = f"⚠️ Server error ({res.status_code}).{FOOTER_TEXT}"
+        except httpx.TimeoutException:
+            reply = f"⏱️ Server Timeout! API response time out ho gaya.{FOOTER_TEXT}"
+        except Exception as e:
+            reply = f"⚠️ Error: {str(e)}{FOOTER_TEXT}"
+
+        USER_STATES[user_id] = None
+        await status_msg.edit_text(reply, reply_markup=get_back_button(), parse_mode="HTML")
+
+# --- RENDER WEB SERVER ---
 async def handle_health_check(request):
-    return web.Response(text="Gemini AI Bot is active 24/7!")
+    return web.Response(text="Info Bot 24/7 is active!")
 
 async def start_web_server():
     server = web.Application()
@@ -103,7 +365,6 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- KEEP-ALIVE SELF PINGER ---
 async def keep_alive_ping():
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
@@ -112,9 +373,8 @@ async def keep_alive_ping():
         await asyncio.sleep(600)
         try:
             await http_client.get(render_url)
-            logging.info("Keep-alive self ping successful!")
-        except Exception as e:
-            logging.warning(f"Self-ping failed: {e}")
+        except Exception:
+            pass
 
 async def main():
     await start_web_server()
@@ -130,6 +390,7 @@ async def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     await app.initialize()
